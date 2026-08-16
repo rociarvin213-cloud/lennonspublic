@@ -1,0 +1,1122 @@
+local Players        = game:GetService("Players")
+local TweenService   = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService    = game:GetService("HttpService")
+local Workspace      = game:GetService("Workspace")
+local RunService     = game:GetService("RunService")
+local CoreGui        = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+local lp     = player
+
+-- ============================================================
+-- SAG FREECAM LOGIC
+-- ============================================================
+local SPRINT_SPEED        = 2.5
+local TOUCH_SENSITIVITY   = 0.6
+local MOUSE_SENSITIVITY   = 0.2
+
+local freecamActive  = false
+local cameraCFrame   = CFrame.new()
+local rotationX      = 0
+local rotationY      = 0
+local freecamRender  = nil
+local freecamSpeed   = SPRINT_SPEED
+
+local PlayerScripts = player:WaitForChild("PlayerScripts")
+local PlayerModule  = require(PlayerScripts:WaitForChild("PlayerModule"))
+local Controls      = PlayerModule:GetControls()
+
+if hookmetamethod and newcclosure then
+	local oldNamecall
+	oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		local method = getnamecallmethod()
+		if freecamActive and method == "Move" then
+			if self == player or (self:IsA("Humanoid") and player.Character and self:IsDescendantOf(player.Character)) then
+				return nil
+			end
+		end
+		return oldNamecall(self, ...)
+	end))
+end
+
+-- ============================================================
+-- RESPONSIVE SCALING
+-- ============================================================
+local camera = Workspace.CurrentCamera
+local function getScale()
+	local vp = camera.ViewportSize
+	-- Base design at 1280x720 so UI is naturally larger on typical screens
+	local scaleX = vp.X / 1280
+	local scaleY = vp.Y / 720
+	local sc = math.clamp(math.min(scaleX, scaleY), 0.75, 1.4)
+	return sc
+end
+
+local SC = getScale()
+
+-- ============================================================
+-- SAG SETTINGS & SAVE SYSTEM
+-- ============================================================
+local SETTINGS_FILE         = "StealAGen_Settings.json"
+local SCREEN_COMBINE_RADIUS = 100
+local VERTICAL_PADDING      = 0
+
+local function saveUDim2(udim2)
+	return {X = {Scale = udim2.X.Scale, Offset = udim2.X.Offset}, Y = {Scale = udim2.Y.Scale, Offset = udim2.Y.Offset}}
+end
+local function loadUDim2(data, default)
+	if type(data) == "table" and data.X and data.Y then
+		return UDim2.new(data.X.Scale, data.X.Offset, data.Y.Scale, data.Y.Offset)
+	end
+	return default
+end
+
+local ALL_TIERS_ORDERED = {
+	"Basic", "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical",
+	"Ethereal", "Ultimate", "Hyper", "Supreme", "Divine", "Godly",
+	"Quantum", "Plasma", "Radiant", "Surge", "Chroma", "Blossom", "Absolute", "Astral"
+}
+local detectedTiers       = {}
+local tierFilterCallbacks = {}
+local tierFilterItems     = {}
+
+local function getGeneratorTier(instance)
+	local rawText   = "Unknown"
+	local textLabel = instance:FindFirstChildWhichIsA("TextLabel", true) or instance:FindFirstChildWhichIsA("TextButton", true)
+	if textLabel and textLabel.Text ~= "" and not string.find(textLabel.Text:lower(), "drop") then
+		rawText = textLabel.Text:gsub("\n", " "):match("^%s*(.-)%s*$")
+	end
+	if rawText == "Unknown" then
+		for _, obj in pairs(instance:GetDescendants()) do
+			if obj:IsA("StringValue") and (obj.Name:lower():find("tier") or obj.Name:lower():find("name")) then
+				rawText = obj.Value; break
+			end
+		end
+	end
+	if rawText == "Unknown" then rawText = instance.Name end
+	local cleanedText = rawText:gsub("%s*[Gg]enerator%s*", ""):match("^%s*(.-)%s*$")
+	return cleanedText ~= "" and cleanedText or "Basic"
+end
+
+local function getTierColor(tierName)
+	local lower = tierName:lower()
+	if string.find(lower, "basic")   then return Color3.fromRGB(255, 255, 255)
+	elseif string.find(lower, "uncommon") or string.find(lower, "common") then return Color3.fromRGB(0, 255, 150)
+	elseif string.find(lower, "rare") or string.find(lower, "epic")       then return Color3.fromRGB(0, 180, 255)
+	elseif string.find(lower, "legendary") or string.find(lower, "mythical") then return Color3.fromRGB(255, 180, 0)
+	else return Color3.fromRGB(255, 50, 255) end
+end
+
+local function detectTiers()
+	local mapFolder        = Workspace:FindFirstChild("Map")
+	local generatorsFolder = mapFolder and mapFolder:FindFirstChild("Generators")
+	local generators       = generatorsFolder and generatorsFolder:GetChildren() or {}
+	local foundTiers = {}
+	for _, gen in pairs(generators) do
+		if gen:IsA("Model") or gen:IsA("BasePart") then
+			local tier = getGeneratorTier(gen)
+			foundTiers[tier] = true
+		end
+	end
+	return foundTiers
+end
+
+SavedSettings = {
+	DragLocked          = false,
+	AutoSave            = true,
+	EspEnabled          = true,
+	PlayerEspEnabled    = false,
+	WallBypasserEnabled = false,
+	InfZoomEnabled      = false,
+	TierFilters         = {},
+	-- Panel positions (persist across sessions)
+	PosFloating  = saveUDim2(UDim2.new(0, 10, 0.5, -29)),
+	PosMain      = nil,
+	PosFilter    = nil,
+	PosVisual    = nil,
+	PosTP        = nil,
+	-- TP action button positions
+	PosBtnFwd    = nil,
+	PosBtnUp     = nil,
+	PosBtnDown   = nil,
+	-- Last open tab (nil = none, "Filter"/"Visual"/"TP")
+	ActiveTab    = nil,
+}
+for _, tier in ipairs(ALL_TIERS_ORDERED) do
+	SavedSettings.TierFilters[tier] = true
+end
+
+-- capturePanelPositions and saveSettings are defined after all panels/buttons are created
+-- so that btnFwd/btnUp/btnDown upvalues are valid. Stubs are replaced below.
+local saveSettings
+saveSettings = function() end  -- stub; overwritten after panels are built
+
+local function loadSettings()
+	if isfile and isfile(SETTINGS_FILE) then
+		local success, result = pcall(function() return HttpService:JSONDecode(readfile(SETTINGS_FILE)) end)
+		if success and type(result) == "table" then
+			for k, v in pairs(result) do
+				if k == "TierFilters" and type(v) == "table" then
+					for savedTier, savedState in pairs(v) do
+						SavedSettings.TierFilters[savedTier] = savedState
+					end
+				else
+					SavedSettings[k] = v
+				end
+			end
+		end
+	end
+end
+
+loadSettings()
+saveSettings()
+
+local function updateDetectedTiers()
+	local newTiers = detectTiers()
+	local changed  = false
+	for tier, _ in pairs(newTiers) do
+		if not detectedTiers[tier] then
+			detectedTiers[tier] = true
+			if SavedSettings.TierFilters[tier] == nil then
+				SavedSettings.TierFilters[tier] = true
+			end
+			changed = true
+		end
+	end
+	if changed then
+		for _, callback in ipairs(tierFilterCallbacks) do callback() end
+	end
+	return changed
+end
+
+-- ============================================================
+-- STYLE CONSTANTS (scaled)
+-- ============================================================
+local COR_FUNDO            = Color3.fromRGB(0, 0, 0)
+local COR_BOTAO_DESATIVADO = Color3.fromRGB(60, 60, 60)
+local COR_BOTAO_ATIVO      = Color3.fromRGB(0, 190, 0)
+local COR_TEXTO            = Color3.fromRGB(255, 255, 255)
+
+local function s(v) return math.round(v * SC) end
+
+local MARGEM = s(7)
+local ESPACO = s(6)
+local ROW_H  = s(28)
+
+local function mkCorner(parent, r)
+	local c = Instance.new("UICorner", parent)
+	c.CornerRadius = UDim.new(0, r or s(9))
+end
+local function mkStroke(parent)
+	pcall(function()
+		local st = Instance.new("UIStroke")
+		st.Color = Color3.fromRGB(0, 0, 0); st.Thickness = 1.2
+		st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		st.Parent = parent
+	end)
+end
+
+-- ============================================================
+-- SCREEN GUI
+-- ============================================================
+local UIContainer = CoreGui
+if get_hidden_ui then UIContainer = get_hidden_ui()
+elseif gethui     then UIContainer = gethui() end
+
+if UIContainer:FindFirstChild("SAG_LennonUI") then
+	UIContainer.SAG_LennonUI:Destroy()
+end
+
+local mlGui = Instance.new("ScreenGui", UIContainer)
+mlGui.Name            = "SAG_LennonUI"
+mlGui.ResetOnSpawn    = false
+mlGui.DisplayOrder    = 2147483647
+mlGui.IgnoreGuiInset  = true
+
+-- ── FLOATING CIRCLE BUTTON ───────────────────────────────────
+local BTN_SZ = s(58)
+local botaoFlutuante = Instance.new("ImageButton", mlGui)
+botaoFlutuante.Size                = UDim2.new(0, BTN_SZ, 0, BTN_SZ)
+botaoFlutuante.Position            = loadUDim2(SavedSettings.PosFloating, UDim2.new(0, 10, 0.5, -BTN_SZ/2))
+botaoFlutuante.BackgroundColor3    = COR_BOTAO_ATIVO
+botaoFlutuante.Image               = "rbxassetid://124111453230698"
+botaoFlutuante.Active              = true
+botaoFlutuante.Draggable           = false
+mkCorner(botaoFlutuante, 999)
+
+-- ── DRAG LOGIC ───────────────────────────────────────────────
+local allDraggables = {}  -- track all draggable frames for lock
+local uiLocked = false   -- forward-declared; set properly after buttons are wired
+
+local function makeDraggable(frame)
+	local dragging, dragStart, startPos = false, nil, nil
+
+	local conn1 = frame.InputBegan:Connect(function(input)
+		if uiLocked then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging  = true
+			dragStart = input.Position
+			startPos  = frame.Position
+		end
+	end)
+	local conn2 = UserInputService.InputChanged:Connect(function(input)
+		if uiLocked then dragging = false return end
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+	local conn3 = UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if dragging then
+				dragging = false
+				saveSettings()
+			end
+		end
+	end)
+
+	local entry = {frame = frame, enabled = true, conns = {conn1, conn2, conn3}}
+	table.insert(allDraggables, entry)
+	return entry
+end
+
+-- floating button drag wired below after all panels/tabs are declared
+
+-- ── MAIN PANEL ───────────────────────────────────────────────
+local LARGURA_M = s(220)
+local TIT_H     = s(30)
+local ROWS_M    = 3
+local ALTURA_M  = TIT_H + (ROW_H + ESPACO) * ROWS_M + ESPACO + s(10)
+
+painel = Instance.new("Frame", mlGui)
+painel.Size                  = UDim2.new(0, LARGURA_M, 0, ALTURA_M)
+painel.Position              = loadUDim2(SavedSettings.PosMain, UDim2.new(0.5, -LARGURA_M/2, 0.5, -ALTURA_M/2))
+painel.BackgroundColor3      = COR_FUNDO
+painel.BackgroundTransparency= 0.4
+painel.Active                = true
+painel.Visible               = false
+mkCorner(painel, s(15))
+
+makeDraggable(painel)
+
+local titulo = Instance.new("TextLabel", painel)
+titulo.Size               = UDim2.new(1, 0, 0, TIT_H)
+titulo.Text               = "Cashflow 2"   -- FIX: updated header
+titulo.TextSize           = s(16)
+titulo.Font               = Enum.Font.Arcade
+titulo.TextColor3         = COR_BOTAO_ATIVO
+titulo.TextXAlignment     = Enum.TextXAlignment.Center
+titulo.BackgroundTransparency = 1
+
+-- Helper: full-width button in main panel
+local function fullBtn(y, texto)
+	local b = Instance.new("TextButton", painel)
+	b.Size              = UDim2.new(0, LARGURA_M - MARGEM*2, 0, ROW_H)
+	b.Position          = UDim2.new(0, MARGEM, 0, y)
+	b.BackgroundColor3  = COR_BOTAO_DESATIVADO
+	b.Text              = texto
+	b.TextSize          = s(12)
+	b.Font              = Enum.Font.Arcade
+	b.TextColor3        = COR_TEXTO
+	b.BorderSizePixel   = 0
+	b.TextWrapped       = true
+	mkCorner(b); mkStroke(b)
+	return b
+end
+
+-- Helper: third-wide button
+local function thirdBtn(y, slot, texto)
+	local third = math.floor((LARGURA_M - MARGEM*2 - ESPACO*2) / 3)
+	local xOff  = MARGEM + (third + ESPACO) * (slot - 1)
+	local b = Instance.new("TextButton", painel)
+	b.Size             = UDim2.new(0, third, 0, ROW_H)
+	b.Position         = UDim2.new(0, xOff, 0, y)
+	b.BackgroundColor3 = COR_BOTAO_DESATIVADO
+	b.Text             = texto
+	b.TextSize         = s(10)
+	b.Font             = Enum.Font.Arcade
+	b.TextColor3       = COR_TEXTO
+	b.BorderSizePixel  = 0
+	b.TextWrapped      = true
+	mkCorner(b); mkStroke(b)
+	return b
+end
+
+local posY = TIT_H + ESPACO
+
+-- ROW 1: Free Cam toggle
+local btnFreecam = fullBtn(posY, "Free Cam: OFF")
+posY = posY + ROW_H + ESPACO
+
+-- ROW 2: Freecam Speed label + textbox (FIX: textbox smaller, pushed right)
+local speedLbl = Instance.new("TextLabel", painel)
+speedLbl.Size             = UDim2.new(0, s(120), 0, ROW_H)
+speedLbl.Position         = UDim2.new(0, MARGEM, 0, posY)
+speedLbl.Text             = "Freecam Speed:"
+speedLbl.TextSize         = s(11)
+speedLbl.Font             = Enum.Font.Arcade
+speedLbl.TextColor3       = COR_TEXTO
+speedLbl.TextXAlignment   = Enum.TextXAlignment.Left
+speedLbl.BackgroundTransparency = 1
+
+local speedBox = Instance.new("TextBox", painel)
+speedBox.Size             = UDim2.new(0, s(55), 0, ROW_H - s(4))   -- FIX: smaller
+speedBox.Position         = UDim2.new(1, -MARGEM - s(55), 0, posY + s(2))  -- FIX: right-aligned
+speedBox.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+speedBox.BorderSizePixel  = 0
+speedBox.Text             = tostring(freecamSpeed)
+speedBox.TextSize         = s(12)
+speedBox.Font             = Enum.Font.Arcade
+speedBox.TextColor3       = COR_TEXTO
+speedBox.ClearTextOnFocus = false
+mkCorner(speedBox, s(6)); mkStroke(speedBox)
+
+local function commitFreecamSpeed()
+	local raw = (speedBox.Text or ""):gsub(",", "."):match("^%s*(.-)%s*$")
+	local v = tonumber(raw)
+	if v and v > 0 and v <= 500 then
+		freecamSpeed = v
+	end
+	speedBox.Text = tostring(freecamSpeed)
+end
+
+speedBox.FocusLost:Connect(function(_enterPressed)
+	commitFreecamSpeed()
+end)
+speedBox:GetPropertyChangedSignal("Text"):Connect(function()
+	if speedBox.Text:find("\n") then
+		speedBox.Text = speedBox.Text:gsub("\n", "")
+		commitFreecamSpeed()
+	end
+end)
+
+posY = posY + ROW_H + ESPACO
+
+-- ROW 3: Tab buttons
+local btnFilterTab = thirdBtn(posY, 1, "Filter")
+local btnVisualTab = thirdBtn(posY, 2, "Visual")
+local btnTPTab     = thirdBtn(posY, 3, "TP")
+
+tabButtons = {btnFilterTab, btnVisualTab, btnTPTab}
+
+-- ============================================================
+-- FREE CAM TOGGLE
+-- ============================================================
+local function disableFreecam()
+	freecamActive = false
+	if freecamRender then freecamRender:Disconnect(); freecamRender = nil end
+	Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+	local char = player.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then hrp.Anchored = false end
+	btnFreecam.BackgroundColor3 = COR_BOTAO_DESATIVADO
+	btnFreecam.Text = "Free Cam: OFF"
+end
+
+local function enableFreecam()
+	local activeCamera = Workspace.CurrentCamera
+	freecamActive  = true
+	cameraCFrame   = activeCamera.CFrame
+	local lv       = cameraCFrame.LookVector
+	rotationX      = math.atan2(-lv.X, -lv.Z)
+	rotationY      = math.asin(math.clamp(lv.Y, -1, 1))
+	activeCamera.CameraType = Enum.CameraType.Scriptable
+	local char = player.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then hrp.Anchored = true end
+	btnFreecam.BackgroundColor3 = COR_BOTAO_ATIVO
+	btnFreecam.Text = "Free Cam: ON"
+
+	freecamRender = RunService.RenderStepped:Connect(function()
+		local currentSpeed  = freecamSpeed
+		local moveVector    = Controls:GetMoveVector()
+		local forwardVector = cameraCFrame.LookVector
+		local rightVector   = cameraCFrame.RightVector
+		local moveDirection = Vector3.new()
+		if moveVector.Magnitude > 0 then
+			moveDirection = (forwardVector * -moveVector.Z) + (rightVector * moveVector.X)
+		end
+		if moveDirection.Magnitude > 0 then
+			moveDirection = moveDirection.Unit * currentSpeed
+		end
+		cameraCFrame = cameraCFrame + moveDirection
+		Workspace.CurrentCamera.CFrame = cameraCFrame
+	end)
+end
+
+btnFreecam.MouseButton1Click:Connect(function()
+	if freecamActive then disableFreecam() else enableFreecam() end
+end)
+
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if not freecamActive or gameProcessed then return end
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+		local delta       = input.Delta
+		local sensitivity = input.UserInputType == Enum.UserInputType.Touch and TOUCH_SENSITIVITY or MOUSE_SENSITIVITY
+		rotationX = rotationX - (delta.X * (sensitivity / 100))
+		rotationY = math.clamp(rotationY - (delta.Y * (sensitivity / 100)), -math.rad(82), math.rad(82))
+		cameraCFrame = CFrame.new(cameraCFrame.Position) * CFrame.Angles(0, rotationX, 0) * CFrame.Angles(rotationY, 0, 0)
+		Workspace.CurrentCamera.CFrame = cameraCFrame
+	end
+end)
+
+player.CharacterAdded:Connect(function()
+	if freecamActive then disableFreecam() end
+end)
+
+-- ============================================================
+-- SIDE PANEL FACTORY
+-- ============================================================
+local LARGURA_S = s(200)
+local TIT_S_H   = s(28)
+
+sidePanels = {}
+
+local function mkSidePanel(headerText)
+	local frame = Instance.new("Frame", mlGui)
+	frame.BackgroundColor3       = COR_FUNDO
+	frame.BackgroundTransparency = 0.4
+	frame.Active                 = true
+	frame.Visible                = false
+	mkCorner(frame, s(15))
+
+	makeDraggable(frame)  -- FIX: all side panels are draggable via our system
+
+	local hdr = Instance.new("TextLabel", frame)
+	hdr.Size               = UDim2.new(1, 0, 0, TIT_S_H)
+	hdr.Text               = headerText
+	hdr.TextSize           = s(14)
+	hdr.Font               = Enum.Font.Arcade
+	hdr.TextColor3         = COR_BOTAO_ATIVO
+	hdr.TextXAlignment     = Enum.TextXAlignment.Center
+	hdr.BackgroundTransparency = 1
+
+	table.insert(sidePanels, frame)
+	return frame
+end
+
+local function closeAllSide()
+	for _, f in ipairs(sidePanels) do f.Visible = false end
+end
+
+local function toggleSide(frame, tabBtn)
+	local wasVisible = frame.Visible
+	closeAllSide()
+	for _, b in ipairs(tabButtons) do b.BackgroundColor3 = COR_BOTAO_DESATIVADO end
+	if not wasVisible then
+		frame.Visible = true
+		tabBtn.BackgroundColor3 = COR_BOTAO_ATIVO
+		-- Remember which tab is open
+		if frame == frameFilter then SavedSettings.ActiveTab = "Filter"
+		elseif frame == frameVisual then SavedSettings.ActiveTab = "Visual"
+		elseif frame == frameTP then SavedSettings.ActiveTab = "TP"
+		end
+	else
+		SavedSettings.ActiveTab = nil
+	end
+	saveSettings()
+end
+
+-- helper: full-width row in side panel
+local function sideFull(parent, y, w, texto)
+	local b = Instance.new("TextButton", parent)
+	b.Size             = UDim2.new(0, w - MARGEM*2, 0, ROW_H)
+	b.Position         = UDim2.new(0, MARGEM, 0, y)
+	b.BackgroundColor3 = COR_BOTAO_DESATIVADO
+	b.Text             = texto
+	b.TextSize         = s(11)
+	b.Font             = Enum.Font.Arcade
+	b.TextColor3       = COR_TEXTO
+	b.BorderSizePixel  = 0
+	b.TextWrapped      = true
+	mkCorner(b); mkStroke(b)
+	return b
+end
+
+-- ============================================================
+-- FILTER TAB
+-- ============================================================
+local frameFilter = mkSidePanel("Filter")
+frameFilter.Size     = UDim2.new(0, LARGURA_S, 0, s(350))
+frameFilter.Position = loadUDim2(SavedSettings.PosFilter, UDim2.new(1, -LARGURA_S - s(10), 0.5, -s(175)))
+
+local hintFilter = Instance.new("TextLabel", frameFilter)
+hintFilter.Size             = UDim2.new(1, -s(10), 0, s(14))
+hintFilter.Position         = UDim2.new(0, s(5), 0, TIT_S_H + s(2))
+hintFilter.Text             = "tap to toggle generators"
+hintFilter.TextSize         = s(9)
+hintFilter.Font             = Enum.Font.Arcade
+hintFilter.TextColor3       = Color3.fromRGB(200, 200, 200)
+hintFilter.TextXAlignment   = Enum.TextXAlignment.Left
+hintFilter.BackgroundTransparency = 1
+
+local scrollFilter = Instance.new("ScrollingFrame", frameFilter)
+scrollFilter.Size                = UDim2.new(1, -s(8), 1, -(TIT_S_H + s(20) + s(4)))
+scrollFilter.Position            = UDim2.new(0, s(4), 0, TIT_S_H + s(20))
+scrollFilter.BackgroundTransparency = 1
+scrollFilter.BorderSizePixel     = 0
+scrollFilter.ScrollBarThickness  = 3
+scrollFilter.ScrollBarImageColor3 = COR_BOTAO_ATIVO
+scrollFilter.CanvasSize          = UDim2.new(0, 0, 0, 0)
+
+local layoutFilter = Instance.new("UIListLayout", scrollFilter)
+layoutFilter.Padding             = UDim.new(0, s(4))
+layoutFilter.SortOrder           = Enum.SortOrder.LayoutOrder
+layoutFilter.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+layoutFilter:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	scrollFilter.CanvasSize = UDim2.new(0, 0, 0, layoutFilter.AbsoluteContentSize.Y + s(4))
+end)
+
+local filterCheckboxes = {}
+
+local function isFilterActive(tier)
+	return SavedSettings.TierFilters[tier] ~= false
+end
+
+local function setFilterActive(box, active)
+	box.active = active
+	box.bg.BackgroundColor3   = active and Color3.fromRGB(0, 60, 0) or Color3.fromRGB(30, 30, 30)
+	box.tickLbl.TextTransparency = active and 0 or 1
+	box.check.BackgroundColor3   = active and COR_BOTAO_ATIVO or Color3.fromRGB(44, 50, 70)
+end
+
+local function buildFilterRows()
+	for tier, box in pairs(filterCheckboxes) do
+		if box.bg and box.bg.Parent then box.bg:Destroy() end
+	end
+	filterCheckboxes = {}
+
+	local finalList = {}
+	local added     = {}
+	for _, tier in ipairs(ALL_TIERS_ORDERED) do
+		table.insert(finalList, tier); added[tier] = true
+	end
+	for tier, _ in pairs(detectedTiers) do
+		if not added[tier] then table.insert(finalList, tier); added[tier] = true end
+	end
+
+	for i, tier in ipairs(finalList) do
+		if SavedSettings.TierFilters[tier] == nil then
+			SavedSettings.TierFilters[tier] = true
+		end
+
+		local RH_F = s(26)
+		local row = Instance.new("Frame", scrollFilter)
+		row.Size             = UDim2.new(1, 0, 0, RH_F)
+		row.LayoutOrder      = i
+		row.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		row.BorderSizePixel  = 0
+		mkCorner(row, s(6))
+
+		local lbl = Instance.new("TextLabel", row)
+		lbl.Size             = UDim2.new(1, -s(30), 1, 0)
+		lbl.Position         = UDim2.new(0, s(7), 0, 0)
+		lbl.Text             = tier
+		lbl.TextSize         = s(11)
+		lbl.Font             = Enum.Font.Arcade
+		lbl.TextColor3       = getTierColor(tier)
+		lbl.TextXAlignment   = Enum.TextXAlignment.Left
+		lbl.BackgroundTransparency = 1
+
+		local cb = Instance.new("Frame", row)
+		cb.Size             = UDim2.new(0, s(16), 0, s(16))
+		cb.Position         = UDim2.new(1, -s(20), 0.5, -s(8))
+		cb.BackgroundColor3 = Color3.fromRGB(44, 50, 70)
+		cb.BorderSizePixel  = 0
+		mkCorner(cb, s(4))
+
+		local tick = Instance.new("TextLabel", cb)
+		tick.Size               = UDim2.new(1, 0, 1, 0)
+		tick.Text               = "\226\156\147"  -- ✓ (UTF-8 safe)
+		tick.TextSize           = s(11)
+		tick.Font               = Enum.Font.GothamBold
+		tick.TextColor3         = Color3.fromRGB(0, 0, 0)
+		tick.TextXAlignment     = Enum.TextXAlignment.Center
+		tick.BackgroundTransparency = 1
+		tick.TextTransparency   = 1
+
+		local clk = Instance.new("TextButton", row)
+		clk.Size               = UDim2.new(1, 0, 1, 0)
+		clk.BackgroundTransparency = 1
+		clk.Text               = ""
+
+		local box = {bg = row, check = cb, tickLbl = tick, active = false}
+		filterCheckboxes[tier] = box
+		setFilterActive(box, isFilterActive(tier))
+
+		clk.MouseButton1Click:Connect(function()
+			local newState = not box.active
+			setFilterActive(box, newState)
+			SavedSettings.TierFilters[tier] = newState
+			saveSettings()
+		end)
+	end
+end
+
+table.insert(tierFilterCallbacks, buildFilterRows)
+buildFilterRows()
+
+-- ============================================================
+-- VISUAL TAB (4 rows: Player ESP, Generator ESP, Lock UI, Auto Save)
+-- ============================================================
+local VIS_ROWS  = 4
+local ALTURA_V  = TIT_S_H + (ROW_H + ESPACO) * VIS_ROWS + ESPACO + s(10)
+
+local frameVisual = mkSidePanel("Visual")
+frameVisual.Size     = UDim2.new(0, LARGURA_S, 0, ALTURA_V)
+frameVisual.Position = loadUDim2(SavedSettings.PosVisual, UDim2.new(1, -LARGURA_S - s(10), 0.5, -ALTURA_V/2))
+
+local vY = TIT_S_H + ESPACO
+
+local btnPlayerESP = sideFull(frameVisual, vY, LARGURA_S, "Player ESP: OFF")
+vY = vY + ROW_H + ESPACO
+
+local btnGenESP = sideFull(frameVisual, vY, LARGURA_S, "Generator ESP: OFF")
+vY = vY + ROW_H + ESPACO
+
+local btnLockUI   = sideFull(frameVisual, vY, LARGURA_S, "Lock UI: OFF")
+vY = vY + ROW_H + ESPACO
+local btnAutoSave = sideFull(frameVisual, vY, LARGURA_S, "Auto Save: ON")
+
+-- ── wire Player ESP ──────────────────────────────────────────
+local function refreshPlayerESP()
+	btnPlayerESP.BackgroundColor3 = SavedSettings.PlayerEspEnabled and COR_BOTAO_ATIVO or COR_BOTAO_DESATIVADO
+	btnPlayerESP.Text = SavedSettings.PlayerEspEnabled and "Player ESP: ON" or "Player ESP: OFF"
+end
+refreshPlayerESP()
+
+btnPlayerESP.MouseButton1Click:Connect(function()
+	SavedSettings.PlayerEspEnabled = not SavedSettings.PlayerEspEnabled
+	refreshPlayerESP()
+	-- FIX: immediately clear labels when toggled off
+	if not SavedSettings.PlayerEspEnabled then
+		for _, label in pairs(playerPool) do label.Visible = false end
+	end
+	saveSettings()
+end)
+
+-- ── wire Generator ESP ───────────────────────────────────────
+local function refreshGenESP()
+	btnGenESP.BackgroundColor3 = SavedSettings.EspEnabled and COR_BOTAO_ATIVO or COR_BOTAO_DESATIVADO
+	btnGenESP.Text = SavedSettings.EspEnabled and "Generator ESP: ON" or "Generator ESP: OFF"
+end
+refreshGenESP()
+
+btnGenESP.MouseButton1Click:Connect(function()
+	SavedSettings.EspEnabled = not SavedSettings.EspEnabled
+	refreshGenESP()
+	-- FIX: immediately clear gen labels when toggled off
+	if not SavedSettings.EspEnabled then
+		for _, label in pairs(genPool) do label.Visible = false end
+	end
+	saveSettings()
+end)
+
+-- ── wire Lock UI (FIX: locks ALL panels + floating btn) ─────
+local function applyLock(locked)
+	uiLocked = locked
+	SavedSettings.DragLocked = locked
+	btnLockUI.BackgroundColor3 = locked and COR_BOTAO_ATIVO or COR_BOTAO_DESATIVADO
+	btnLockUI.Text = locked and "Lock UI: ON" or "Lock UI: OFF"
+end
+
+applyLock(SavedSettings.DragLocked or false)
+
+btnLockUI.MouseButton1Click:Connect(function()
+	applyLock(not uiLocked)
+	saveSettings()
+end)
+
+-- ── wire Auto Save ───────────────────────────────────────────
+local function refreshAutoSave()
+	btnAutoSave.BackgroundColor3 = SavedSettings.AutoSave and COR_BOTAO_ATIVO or COR_BOTAO_DESATIVADO
+	btnAutoSave.Text = SavedSettings.AutoSave and "Auto Save: ON" or "Auto Save: OFF"
+end
+refreshAutoSave()
+
+btnAutoSave.MouseButton1Click:Connect(function()
+	SavedSettings.AutoSave = not SavedSettings.AutoSave
+	refreshAutoSave()
+	if SavedSettings.AutoSave then
+		saveSettings()
+	elseif isfile and isfile(SETTINGS_FILE) then
+		pcall(delfile, SETTINGS_FILE)
+	end
+end)
+
+-- ============================================================
+-- TP TAB — textboxes smaller, pushed right
+-- ============================================================
+local TP_ROWS  = 3
+local ALTURA_T = TIT_S_H + (ROW_H + ESPACO) * TP_ROWS + ESPACO + s(10)
+
+local frameTP = mkSidePanel("TP")
+frameTP.Size     = UDim2.new(0, LARGURA_S, 0, ALTURA_T)
+frameTP.Position = loadUDim2(SavedSettings.PosTP, UDim2.new(1, -LARGURA_S - s(10), 0.5, -ALTURA_T/2))
+
+local tpAmounts = {Up = 10, Down = 10, Forward = 10}
+
+local function mkTPRow(parent, y, label, dirKey)
+	local lbl = Instance.new("TextLabel", parent)
+	lbl.Size             = UDim2.new(0, s(110), 0, ROW_H)
+	lbl.Position         = UDim2.new(0, MARGEM, 0, y)
+	lbl.Text             = label
+	lbl.TextSize         = s(10)
+	lbl.Font             = Enum.Font.Arcade
+	lbl.TextColor3       = COR_TEXTO
+	lbl.TextXAlignment   = Enum.TextXAlignment.Left
+	lbl.BackgroundTransparency = 1
+
+	local BOX_W = s(50)
+	local box = Instance.new("TextBox", parent)
+	box.Size             = UDim2.new(0, BOX_W, 0, ROW_H - s(4))
+	box.Position         = UDim2.new(1, -MARGEM - BOX_W, 0, y + s(2))
+	box.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	box.BorderSizePixel  = 0
+	box.Text             = tostring(tpAmounts[dirKey])
+	box.TextSize         = s(12)
+	box.Font             = Enum.Font.Arcade
+	box.TextColor3       = COR_TEXTO
+	box.ClearTextOnFocus = false
+	mkCorner(box, s(6)); mkStroke(box)
+
+	-- Commit helper — called from both FocusLost and ReturnPressed
+	local function commitValue()
+		local raw = (box.Text or ""):gsub(",", "."):match("^%s*(.-)%s*$")
+		local v = tonumber(raw)
+		if v and v > 0 and v <= 10000 then
+			tpAmounts[dirKey] = v
+		end
+		box.Text = tostring(tpAmounts[dirKey])
+	end
+
+	box.FocusLost:Connect(function(_enterPressed)
+		commitValue()
+	end)
+	-- Also commit on Return key for keyboard users
+	box:GetPropertyChangedSignal("Text"):Connect(function()
+		-- Only auto-commit when text ends with newline (Return pressed)
+		if box.Text:find("\n") then
+			box.Text = box.Text:gsub("\n", "")
+			commitValue()
+		end
+	end)
+end
+
+local tY = TIT_S_H + ESPACO
+mkTPRow(frameTP, tY, "Up studs:", "Up");          tY = tY + ROW_H + ESPACO
+mkTPRow(frameTP, tY, "Down studs:", "Down");      tY = tY + ROW_H + ESPACO
+mkTPRow(frameTP, tY, "Forward studs:", "Forward")
+
+-- ============================================================
+-- TP ACTION BUTTONS — FIX: ALWAYS VISIBLE (not tied to tab)
+-- ============================================================
+local function createTPActionBtn(name, text, defPos, dirKey)
+	local btn = Instance.new("TextButton", mlGui)
+	btn.Name             = name
+	btn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+	btn.BackgroundTransparency = 0.2
+	btn.Size             = UDim2.new(0, s(58), 0, s(58))
+	btn.Position         = defPos
+	btn.Font             = Enum.Font.Arcade
+	btn.Text             = text
+	btn.TextColor3       = COR_TEXTO
+	btn.TextSize         = s(11)
+	btn.TextWrapped      = true
+	btn.Visible          = true   -- FIX: always visible
+	mkCorner(btn, s(12))
+
+	local UIStroke2 = Instance.new("UIStroke")
+	UIStroke2.Color      = COR_BOTAO_ATIVO
+	UIStroke2.Thickness  = 1
+	UIStroke2.Transparency = 0.85
+	UIStroke2.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	UIStroke2.Parent     = btn
+
+	-- drag + click separation
+	local dragging2, dragStart2, startPos2, draggedFar2 = false, nil, nil, false
+	btn.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging2   = true
+			draggedFar2 = false
+			dragStart2  = input.Position
+			startPos2   = btn.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging2 and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			if uiLocked then dragging2 = false return end  -- FIX: respect lock
+			local delta = input.Position - dragStart2
+			if delta.Magnitude > 5 then draggedFar2 = true end
+			btn.Position = UDim2.new(startPos2.X.Scale, startPos2.X.Offset + delta.X, startPos2.Y.Scale, startPos2.Y.Offset + delta.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if dragging2 then
+				dragging2 = false
+				if not draggedFar2 then
+					-- FIX: actually teleport player
+					local char = player.Character
+					local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+					if hrp then
+						local amt = tpAmounts[dirKey]
+						if dirKey == "Forward" then
+							hrp.CFrame = hrp.CFrame * CFrame.new(0, 0, -amt)
+						elseif dirKey == "Up" then
+							hrp.CFrame = hrp.CFrame * CFrame.new(0, amt, 0)
+						elseif dirKey == "Down" then
+							hrp.CFrame = hrp.CFrame * CFrame.new(0, -amt, 0)
+						end
+					end
+				else
+					-- Dragged: save new button position
+					saveSettings()
+				end
+			end
+		end
+	end)
+
+	return btn
+end
+
+-- TP buttons: default just below Roblox menu button (~Y=58), restore saved pos if available
+local TP_BTN_SZ  = s(58)
+local TP_BTN_GAP = s(8)
+local _defFwd  = UDim2.new(0, 10,                                       0, 58)
+local _defUp   = UDim2.new(0, 10 + TP_BTN_SZ + TP_BTN_GAP,             0, 58)
+local _defDown = UDim2.new(0, 10 + (TP_BTN_SZ + TP_BTN_GAP) * 2,       0, 58)
+local btnFwd  = createTPActionBtn("SAG_FwdBtn",  "Forward", loadUDim2(SavedSettings.PosBtnFwd,  _defFwd),  "Forward")
+local btnUp   = createTPActionBtn("SAG_UpBtn",   "Up",      loadUDim2(SavedSettings.PosBtnUp,   _defUp),   "Up")
+local btnDown = createTPActionBtn("SAG_DownBtn", "Down",    loadUDim2(SavedSettings.PosBtnDown, _defDown), "Down")
+
+-- ── TAB BUTTON WIRING ────────────────────────────────────────
+-- FIX: lateral closes when main button clicked (handled in float btn drag end above)
+btnFilterTab.MouseButton1Click:Connect(function()
+	toggleSide(frameFilter, btnFilterTab)
+end)
+btnVisualTab.MouseButton1Click:Connect(function()
+	toggleSide(frameVisual, btnVisualTab)
+end)
+btnTPTab.MouseButton1Click:Connect(function()
+	toggleSide(frameTP, btnTPTab)
+end)
+
+-- ── SAVE / LOAD (real implementation — all panels and buttons exist now) ──────
+local function capturePanelPositions()
+	SavedSettings.PosMain     = saveUDim2(painel.Position)
+	SavedSettings.PosFloating = saveUDim2(botaoFlutuante.Position)
+	SavedSettings.PosFilter   = saveUDim2(frameFilter.Position)
+	SavedSettings.PosVisual   = saveUDim2(frameVisual.Position)
+	SavedSettings.PosTP       = saveUDim2(frameTP.Position)
+	SavedSettings.PosBtnFwd   = saveUDim2(btnFwd.Position)
+	SavedSettings.PosBtnUp    = saveUDim2(btnUp.Position)
+	SavedSettings.PosBtnDown  = saveUDim2(btnDown.Position)
+end
+
+saveSettings = function()
+	if not SavedSettings.AutoSave then return end
+	capturePanelPositions()
+	if writefile then
+		pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(SavedSettings)) end)
+	end
+end
+
+-- ── FLOATING BUTTON DRAG + TOGGLE (wired here so all panel upvalues are valid) ──
+do
+	local dragging, dragStart, startPos, draggedFar = false, nil, nil, false
+	botaoFlutuante.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging   = true
+			draggedFar = false
+			dragStart  = input.Position
+			startPos   = botaoFlutuante.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if uiLocked then dragging = false return end
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 5 then draggedFar = true end
+			botaoFlutuante.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if dragging then
+				dragging = false
+				if draggedFar then
+					saveSettings()
+				else
+					painel.Visible = not painel.Visible
+					if not painel.Visible then
+						for _, f in ipairs(sidePanels) do f.Visible = false end
+						for _, b in ipairs(tabButtons) do b.BackgroundColor3 = COR_BOTAO_DESATIVADO end
+						saveSettings()
+					else
+						-- Restore last open tab
+						local tab = SavedSettings.ActiveTab
+						if tab == "Filter" then
+							frameFilter.Visible = true
+							btnFilterTab.BackgroundColor3 = COR_BOTAO_ATIVO
+						elseif tab == "Visual" then
+							frameVisual.Visible = true
+							btnVisualTab.BackgroundColor3 = COR_BOTAO_ATIVO
+						elseif tab == "TP" then
+							frameTP.Visible = true
+							btnTPTab.BackgroundColor3 = COR_BOTAO_ATIVO
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+-- ============================================================
+-- ESP SYSTEM
+-- ============================================================
+genPool    = {}
+playerPool = {}
+
+local EspScreenGui = Instance.new("ScreenGui")
+EspScreenGui.Name            = "SAG_LennonESP"
+EspScreenGui.ResetOnSpawn    = false
+EspScreenGui.IgnoreGuiInset  = true
+EspScreenGui.DisplayOrder    = 1
+EspScreenGui.Parent          = UIContainer
+
+local function GetOrCreateGenLabel(index)
+	if genPool[index] then return genPool[index] end
+	local label = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(0, s(140), 0, s(16))
+	label.BackgroundTransparency= 1
+	label.Font                  = Enum.Font.Arcade
+	label.TextSize              = s(14)
+	label.TextStrokeTransparency= 0
+	label.TextStrokeColor3      = Color3.fromRGB(0, 0, 0)
+	label.Visible               = false
+	label.Parent                = EspScreenGui
+	genPool[index]              = label
+	return label
+end
+
+local function GetOrCreatePlayerLabel(index)
+	if playerPool[index] then return playerPool[index] end
+	local label = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(0, s(140), 0, s(16))
+	label.BackgroundTransparency= 1
+	label.Font                  = Enum.Font.Arcade
+	label.TextSize              = s(13)
+	label.TextColor3            = Color3.fromRGB(255, 235, 110)
+	label.TextStrokeTransparency= 0
+	label.TextStrokeColor3      = Color3.fromRGB(0, 0, 0)
+	label.Visible               = false
+	label.Parent                = EspScreenGui
+	playerPool[index]           = label
+	return label
+end
+
+local function UpdateESPFrame()
+	local currentCamera = Workspace.CurrentCamera
+	if not currentCamera then return end
+
+	updateDetectedTiers()
+
+	if SavedSettings.EspEnabled then
+		local mapFolder        = Workspace:FindFirstChild("Map")
+		local generatorsFolder = mapFolder and mapFolder:FindFirstChild("Generators")
+		local generators       = generatorsFolder and generatorsFolder:GetChildren() or {}
+		local rawPoints        = {}
+
+		for _, gen in pairs(generators) do
+			if gen:IsA("Model") or gen:IsA("BasePart") then
+				local part = gen:IsA("BasePart") and gen or gen.PrimaryPart or gen:FindFirstChildWhichIsA("BasePart")
+				if part then
+					local tier = getGeneratorTier(gen)
+					if SavedSettings.TierFilters[tier] ~= false then
+						local screenPos, onScreen = currentCamera:WorldToViewportPoint(part.Position + Vector3.new(0, 1.8, 0))
+						if onScreen then
+							table.insert(rawPoints, {tier = tier, x = screenPos.X, y = screenPos.Y, depth = screenPos.Z})
+						end
+					end
+				end
+			end
+		end
+
+		local screenClusters = {}
+		for _, pt in ipairs(rawPoints) do
+			local matched = false
+			for _, cluster in ipairs(screenClusters) do
+				if cluster.tier == pt.tier then
+					local dist = math.sqrt((cluster.x - pt.x)^2 + (cluster.y - pt.y)^2)
+					if dist <= SCREEN_COMBINE_RADIUS then
+						cluster.count = cluster.count + 1
+						cluster.x     = (cluster.x * (cluster.count - 1) + pt.x) / cluster.count
+						cluster.y     = (cluster.y * (cluster.count - 1) + pt.y) / cluster.count
+						cluster.depth = math.min(cluster.depth, pt.depth)
+						matched = true; break
+					end
+				end
+			end
+			if not matched then
+				table.insert(screenClusters, {tier = pt.tier, x = pt.x, y = pt.y, depth = pt.depth, count = 1, width = s(140), height = s(16)})
+			end
+		end
+
+		table.sort(screenClusters, function(a, b) return a.depth < b.depth end)
+
+		for i = 1, #screenClusters do
+			local current = screenClusters[i]
+			for j = 1, i - 1 do
+				local existing = screenClusters[j]
+				local hOverlap = math.abs(current.x - existing.x) < ((current.width + existing.width) / 2)
+				local vOverlap = math.abs(current.y - existing.y) < current.height
+				if hOverlap and vOverlap then
+					current.y = existing.y - current.height - VERTICAL_PADDING
+				end
+			end
+		end
+
+		for _, label in pairs(genPool) do label.Visible = false end
+		for idx, cluster in ipairs(screenClusters) do
+			local uiLabel = GetOrCreateGenLabel(idx)
+			uiLabel.Text       = (cluster.count > 1) and (cluster.tier .. " x" .. cluster.count) or cluster.tier
+			uiLabel.TextColor3 = getTierColor(cluster.tier)
+			uiLabel.Position   = UDim2.new(0, cluster.x - (cluster.width / 2), 0, cluster.y - (cluster.height / 2))
+			uiLabel.Visible    = true
+		end
+	else
+		for _, label in pairs(genPool) do label.Visible = false end
+	end
+
+	if SavedSettings.PlayerEspEnabled then
+		for _, label in pairs(playerPool) do label.Visible = false end
+		local playerIdx     = 1
+		local activePlayers = Players:GetPlayers()
+		for i = 1, #activePlayers do
+			local p = activePlayers[i]
+			if p ~= player and p.Character then
+				local head = p.Character:FindFirstChild("Head")
+				if head then
+					local screenPos, onScreen = currentCamera:WorldToViewportPoint(head.Position + Vector3.new(0, 1.5, 0))
+					if onScreen then
+						local pLabel    = GetOrCreatePlayerLabel(playerIdx)
+						pLabel.Text     = p.DisplayName or p.Name
+						pLabel.Position = UDim2.new(0, screenPos.X - s(70), 0, screenPos.Y - s(8))
+						pLabel.Visible  = true
+						playerIdx       = playerIdx + 1
+					end
+				end
+			end
+		end
+	else
+		for _, label in pairs(playerPool) do label.Visible = false end
+	end
+end
+
+RunService.RenderStepped:Connect(UpdateESPFrame)
+
+print("[Cashflow 2 UI] Loaded successfully.")
